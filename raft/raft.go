@@ -16,6 +16,8 @@ package raft
 
 import (
 	"errors"
+	"math/rand"
+	"time"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -157,6 +159,13 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	// self-defining for randomized election timeout
+	rand *rand.Rand
+	// this can reduce conflicts down to <= 0.3,
+	// an old implementation which defined the isElectionTimeout() func instead
+	// of randomizedElectionTimeout, is <= 0.4, which is not satisfy our tests
+	randomizedElectionTimeout int
 }
 
 // newRaft return a raft peer with the given config
@@ -165,50 +174,134 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+
+	r := &Raft{
+		id:               c.ID,
+		RaftLog:          newLog(c.Storage),
+		Prs:              make(map[uint64]*Progress),
+		votes:            make(map[uint64]bool),
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+		rand:             rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+
+	for _, p := range c.peers {
+		r.Prs[p] = &Progress{Next: 1}
+	}
+
+	// starts as follower
+	r.becomeFollower(r.Term, None)
+
+	return r
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+
+	r.send(pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		To:      to,
+	})
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+
+	r.send(pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeat,
+		To:      to,
+	})
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+
+	switch r.State {
+	case StateFollower:
+		r.tickElection()
+	case StateCandidate:
+		r.tickElection()
+	case StateLeader:
+		r.tickHeartbeat()
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+
+	r.reset(term)
+	r.State = StateFollower
+	r.Lead = lead
+	r.electionElapsed = 0
+	r.randomizedElectionTimeout = r.electionTimeout + r.rand.Intn(r.electionTimeout)
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+
+	r.reset(r.Term + 1)
+	r.State = StateCandidate
+	// vote for self
+	r.Vote = r.id
+	r.electionElapsed = 0
+	r.randomizedElectionTimeout = r.electionTimeout + r.rand.Intn(r.electionTimeout)
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+
+	r.reset(r.Term)
+	r.State = StateLeader
+	r.Lead = r.id
+	r.heartbeatElapsed = 0
+
+	// no-op
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+
+	// trigger r itself to start a new election
+	if m.MsgType == pb.MessageType_MsgHup {
+		if r.State != StateLeader {
+			r.compaign()
+			return nil
+		}
+	}
+
+	switch {
+	case m.Term == 0:
+		// local message
+	case m.Term < r.Term:
+		// ignore
+		return nil
+	case m.Term > r.Term:
+		lead := m.From
+		if m.MsgType == pb.MessageType_MsgRequestVote {
+			lead = None
+		}
+
+		r.becomeFollower(m.Term, lead)
+	}
+
 	switch r.State {
 	case StateFollower:
+		r.stepFollower(m)
 	case StateCandidate:
+		r.stepCandidate(m)
 	case StateLeader:
+		r.stepLeader(m)
 	}
 	return nil
 }
@@ -216,11 +309,21 @@ func (r *Raft) Step(m pb.Message) error {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+
+	r.send(pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+	})
 }
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+
+	r.send(pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+		To:      m.From,
+	})
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -236,4 +339,199 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+// self-defining functions
+func (r *Raft) send(m pb.Message) {
+	m.From = r.id
+
+	// not local message
+	if m.MsgType != pb.MessageType_MsgPropose {
+		m.Term = r.Term
+	}
+	// push to mailbox
+	r.msgs = append(r.msgs, m)
+}
+
+func (r *Raft) bcastAppend() {
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+
+		r.sendAppend(id)
+	}
+}
+
+func (r *Raft) bcastHeartbeat() {
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+
+		r.sendHeartbeat(id)
+	}
+}
+
+func (r *Raft) tickElection() {
+	r.electionElapsed++
+	if r.pastElectionTimeout() {
+		r.electionElapsed = 0
+
+		r.Step(pb.Message{
+			MsgType: pb.MessageType_MsgHup,
+			From:    r.id,
+		})
+	}
+}
+
+func (r *Raft) tickHeartbeat() {
+	r.heartbeatElapsed++
+
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.heartbeatElapsed = 0
+
+		r.Step(pb.Message{
+			MsgType: pb.MessageType_MsgBeat,
+			From:    r.id,
+		})
+	}
+
+}
+
+// pastElectionTimeout returns true iff r.electionElapsed is greater
+// than or equal to the randomized election timeout in
+// [electiontimeout, 2 * electiontimeout - 1].
+func (r *Raft) pastElectionTimeout() bool {
+	return r.electionElapsed >= r.randomizedElectionTimeout
+}
+
+func (r *Raft) reset(term uint64) {
+	if r.Term != term {
+		r.Term = term
+		// since r.Vote is stored for current term
+		r.Vote = None
+	}
+
+	r.Lead = None
+	r.votes = make(map[uint64]bool)
+}
+
+func (r *Raft) compaign() {
+	r.becomeCandidate()
+	// update votemap, votes for self
+	r.poll(r.id, true)
+	if r.granted() == r.quorum() {
+		r.becomeLeader()
+		return
+	}
+
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgRequestVote,
+			To:      id,
+		})
+	}
+}
+
+func (r *Raft) quorum() int {
+	return len(r.Prs)/2 + 1
+}
+
+func (r *Raft) poll(id uint64, v bool) {
+	// vote only once
+	if _, ok := r.votes[id]; !ok {
+		r.votes[id] = v
+	}
+}
+
+func (r *Raft) granted() (granted int) {
+	for _, v := range r.votes {
+		if v {
+			granted++
+		}
+	}
+
+	return granted
+}
+
+func (r *Raft) stepFollower(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgAppend:
+		r.handleAppendEntries(m)
+	case pb.MessageType_MsgHeartbeat:
+		r.handleHeartbeat(m)
+	case pb.MessageType_MsgPropose:
+		// redirect to leader
+		m.To = r.Lead
+		r.send(m)
+	case pb.MessageType_MsgRequestVote:
+		r.handleRequestVote(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
+	}
+}
+
+func (r *Raft) stepCandidate(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgAppend:
+		r.becomeFollower(r.Term, m.From)
+		r.handleAppendEntries(m)
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(r.Term, m.From)
+		r.handleHeartbeat(m)
+	case pb.MessageType_MsgRequestVote:
+		// since we already vote for self
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+			Reject:  true,
+		})
+	case pb.MessageType_MsgRequestVoteResponse:
+		// push to poll(update votesmap)
+		r.poll(m.From, !m.Reject)
+		granted := r.granted()
+
+		// once we get quorum votes, we become a leader
+		switch r.quorum() {
+		case granted:
+			r.becomeLeader()
+			r.bcastHeartbeat()
+			// or we get quorum rejections first
+		case len(r.votes) - granted:
+			r.becomeFollower(r.Term, None)
+		}
+	}
+}
+
+func (r *Raft) stepLeader(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgBeat:
+		r.bcastHeartbeat()
+	case pb.MessageType_MsgRequestVote:
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+			Reject:  true,
+		})
+	}
+}
+
+func (r *Raft) handleRequestVote(m pb.Message) {
+	if r.Vote == None || r.Vote == m.From {
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+		})
+		r.Vote = m.From
+	} else {
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+			Reject:  true,
+		})
+	}
 }
